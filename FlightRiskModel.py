@@ -17,8 +17,8 @@ st.set_page_config(page_title="Flight Risk Predictor (Pure XGBoost)", layout="wi
 st.title("✈ Employee Flight Risk Predictor (Pure XGBoost)")
 
 st.markdown("""
-This version is 100% compatible with **Python 3.13** — no scikit-learn needed.  
-It uses the core XGBoost API directly.
+This version uses **only XGBoost, pandas, and numpy** — no scikit-learn.
+It is 100% compatible with **Python 3.13**.
 
 **Workflow**
 1. Upload employee CSV  
@@ -63,7 +63,6 @@ else:
 
 st.dataframe(df.head(20))
 
-# Validate
 if TARGET_COLUMN not in df.columns:
     st.error(f"Target column '{TARGET_COLUMN}' not found.")
     st.stop()
@@ -100,24 +99,34 @@ train_df = df.dropna(subset=[TARGET_COLUMN])
 X = train_df[selected_features]
 y = train_df[TARGET_COLUMN]
 
-# Convert y to numeric (0/1) safely
-y = pd.to_numeric(y, errors="coerce").fillna(0).astype(int)
+# Convert y to 0/1 strictly
+y = pd.to_numeric(y, errors="coerce").fillna(0)
+y = (y > 0).astype(int)
 
-# One-hot encode categoricals & clean
+# One-hot encode categoricals
 X_encoded = pd.get_dummies(X, drop_first=True)
+
+# Replace bad values
 X_encoded = X_encoded.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+# Remove constant columns (all zeros)
+X_encoded = X_encoded.loc[:, (X_encoded != 0).any(axis=0)]
 
 # Split data
 X_train, X_test, y_train, y_test = simple_split(X_encoded, y, test_size=0.2, seed=42)
 
-# Diagnostic info
+# Sanity checks
+if X_train.empty or len(np.unique(y_train)) < 2:
+    st.error("❌ Training data invalid — empty or only one class in target.")
+    st.stop()
+
 st.write("Training shape:", X_train.shape)
 st.write("Unique labels:", np.unique(y_train))
 st.write("Any NaN in X_train?", np.isnan(X_train.values).any())
 
 # Convert to DMatrix
-dtrain = xgb.DMatrix(X_train.values, label=y_train.values)
-dtest = xgb.DMatrix(X_test.values, label=y_test.values)
+dtrain = xgb.DMatrix(X_train.values.astype(float), label=y_train.values.astype(float))
+dtest = xgb.DMatrix(X_test.values.astype(float), label=y_test.values.astype(float))
 
 # ----------------------------------------------------
 # 5️⃣ TRAIN PURE XGBOOST MODEL
@@ -134,12 +143,17 @@ params = {
     "seed": 42,
 }
 
-with st.spinner("Training XGBoost model..."):
-    model = xgb.train(params, dtrain, num_boost_round=300, evals=[(dtest, "test")], verbose_eval=False)
+try:
+    with st.spinner("Training XGBoost model..."):
+        model = xgb.train(params, dtrain, num_boost_round=300,
+                          evals=[(dtest, "test")], verbose_eval=False)
+    st.success("✅ Model training complete!")
+except xgb.core.XGBoostError as e:
+    st.error("❌ XGBoost training failed:")
+    st.code(str(e))
+    st.stop()
 
-st.success("✅ Model training complete!")
-
-# Evaluate
+# Evaluate quickly
 y_pred = model.predict(dtest)
 y_pred_class = (y_pred >= 0.5).astype(int)
 accuracy = np.mean(y_pred_class == y_test.values)
@@ -150,7 +164,6 @@ st.write(f"**Test Accuracy:** {accuracy:.3f}")
 # ----------------------------------------------------
 st.header("4. Score Active Employees")
 active_df = df[df[ACTIVE_FLAG_COL] == 0].copy()
-
 if active_df.empty:
     st.warning("No active employees found (active_flag == 0).")
     st.stop()
@@ -158,12 +171,13 @@ if active_df.empty:
 # Prepare active data
 X_active = pd.get_dummies(active_df[selected_features], drop_first=True)
 X_active = X_active.reindex(columns=X_encoded.columns, fill_value=0)
-dactive = xgb.DMatrix(X_active.values)
+X_active = X_active.replace([np.inf, -np.inf], np.nan).fillna(0)
+dactive = xgb.DMatrix(X_active.values.astype(float))
 
 # Predict
 active_df["flight_risk_prediction"] = model.predict(dactive)
 
-# Banding logic
+# Banding
 def risk_band(score):
     if score >= 0.95:
         return "HIGH"
@@ -176,7 +190,6 @@ def risk_band(score):
 
 active_df["flight_risk_band"] = active_df["flight_risk_prediction"].apply(risk_band)
 
-# Show results
 st.dataframe(
     active_df[selected_features + ["flight_risk_prediction", "flight_risk_band"]]
     .sort_values("flight_risk_prediction", ascending=False)
