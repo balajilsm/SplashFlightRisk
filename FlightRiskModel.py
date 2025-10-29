@@ -60,7 +60,7 @@ st.header("1. Upload / Load Data")
 uploaded = st.file_uploader("Upload employee CSV", type=["csv"])
 
 if uploaded is not None:
-    df = pd.read_csv(uploaded)
+   df = pd.read_csv(uploaded, dtype={'term_date': str, 'previous_salary': float}, low_memory=False)
     st.success("✅ File uploaded successfully.")
 else:
     try:
