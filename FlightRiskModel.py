@@ -2,35 +2,50 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from xgboost import XGBClassifier
-from sklearn.model_selection import train_test_split
 
 # ----------------------------------------------------
-# CONFIG: Update these column names if your CSV differs
+# CONFIG: Update these column names for your dataset
 # ----------------------------------------------------
 CSV_PATH_DEFAULT = "/mnt/data/emp_history_data2.csv"
-TARGET_COLUMN = "flight_risk"      # <-- replace with your label column
-ACTIVE_FLAG_COL = "active_flag"    # <-- 0 = active, 1 = terminated
+TARGET_COLUMN = "flight_risk"      # your label column (0/1)
+ACTIVE_FLAG_COL = "active_flag"    # 0 = active, 1 = terminated
 
 # ----------------------------------------------------
-# APP SETUP
+# APP HEADER
 # ----------------------------------------------------
 st.set_page_config(page_title="Flight Risk Predictor (XGBoost Only)", layout="wide")
 st.title("✈ Employee Flight Risk Predictor (XGBoost Only)")
 
 st.markdown("""
-This version avoids scikit-learn.  
-It uses only **XGBoost**, **pandas**, and **numpy** — safe for Python 3.13.
+This lightweight version **runs on Python 3.13** — no scikit-learn required.  
+It uses only **XGBoost**, **pandas**, and **numpy**.
 
-**Steps:**
+**Workflow**
 1. Upload employee CSV  
-2. Select features  
-3. Train XGBoost  
-4. Predict only active employees (flag = 0)  
-5. Download results  
+2. Choose features  
+3. Train XGBoost model  
+4. Predict for active employees (flag = 0)  
+5. Download results with risk bands  
 """)
 
 # ----------------------------------------------------
-# 1️⃣ LOAD CSV
+# Helper: simple train/test split (no sklearn)
+# ----------------------------------------------------
+def simple_split(X, y, test_size=0.2, seed=42):
+    np.random.seed(seed)
+    idx = np.arange(len(X))
+    np.random.shuffle(idx)
+    split = int(len(X) * (1 - test_size))
+    train_idx, test_idx = idx[:split], idx[split:]
+    return (
+        X.iloc[train_idx],
+        X.iloc[test_idx],
+        y.iloc[train_idx],
+        y.iloc[test_idx],
+    )
+
+# ----------------------------------------------------
+# 1️⃣ LOAD DATA
 # ----------------------------------------------------
 st.header("1. Upload / Load Data")
 uploaded = st.file_uploader("Upload your employee CSV", type=["csv"])
@@ -43,18 +58,17 @@ else:
         df = pd.read_csv(CSV_PATH_DEFAULT)
         st.info(f"No file uploaded — using default: {CSV_PATH_DEFAULT}")
     except Exception as e:
-        st.error(f"Couldn't load CSV: {e}")
+        st.error(f"Could not load CSV: {e}")
         st.stop()
 
 st.dataframe(df.head(20))
 
-# Basic checks
+# Validate columns
 if TARGET_COLUMN not in df.columns:
-    st.error(f"Target column '{TARGET_COLUMN}' not found. Update it in the code.")
+    st.error(f"Target column '{TARGET_COLUMN}' not found.")
     st.stop()
-
 if ACTIVE_FLAG_COL not in df.columns:
-    st.error(f"Active flag column '{ACTIVE_FLAG_COL}' not found. Update it in the code.")
+    st.error(f"Active flag column '{ACTIVE_FLAG_COL}' not found.")
     st.stop()
 
 # ----------------------------------------------------
@@ -69,7 +83,7 @@ selected_features = st.multiselect(
 )
 
 if len(selected_features) == 0:
-    st.warning("Select at least one feature.")
+    st.warning("Please select at least one feature.")
     st.stop()
 
 # ----------------------------------------------------
@@ -87,16 +101,14 @@ train_df = df.dropna(subset=[TARGET_COLUMN])
 X = train_df[selected_features]
 y = train_df[TARGET_COLUMN]
 
-# Encode categoricals manually (one-hot via pandas)
+# Encode categoricals
 X_encoded = pd.get_dummies(X, drop_first=True)
 
-# Split manually (still uses sklearn, but lightweight pure Python)
-X_train, X_test, y_train, y_test = train_test_split(
-    X_encoded, y, test_size=0.2, random_state=42, stratify=y if len(np.unique(y)) > 1 else None
-)
+# Split data
+X_train, X_test, y_train, y_test = simple_split(X_encoded, y, test_size=0.2, seed=42)
 
 # ----------------------------------------------------
-# 5️⃣ TRAIN XGBOOST
+# 5️⃣ TRAIN XGBOOST MODEL
 # ----------------------------------------------------
 st.header("3. Model Training")
 model = XGBClassifier(
@@ -110,41 +122,35 @@ model = XGBClassifier(
     n_jobs=-1
 )
 
-with st.spinner("Training XGBoost..."):
+with st.spinner("Training XGBoost model..."):
     model.fit(X_train, y_train)
 st.success("✅ Model training complete!")
 
-# Evaluate quickly
+# Evaluate performance
 y_pred = model.predict(X_test)
 y_pred_proba = model.predict_proba(X_test)[:, 1]
-
 accuracy = (y_pred == y_test).mean()
 st.write(f"**Test Accuracy:** {accuracy:.3f}")
-try:
-    from sklearn.metrics import roc_auc_score
-    auc = roc_auc_score(y_test, y_pred_proba)
-    st.write(f"**ROC-AUC:** {auc:.3f}")
-except Exception:
-    st.write("ROC-AUC not available (sklearn not installed).")
 
 # ----------------------------------------------------
 # 6️⃣ SCORE ACTIVE EMPLOYEES
 # ----------------------------------------------------
 st.header("4. Score Active Employees")
 active_df = df[df[ACTIVE_FLAG_COL] == 0].copy()
+
 if active_df.empty:
     st.warning("No active employees found (active_flag == 0).")
     st.stop()
 
+# Prepare features for prediction
 X_active = pd.get_dummies(active_df[selected_features], drop_first=True)
-
-# Align to training features (in case dummy columns differ)
 X_active = X_active.reindex(columns=X_encoded.columns, fill_value=0)
 
+# Predict
 active_df["flight_risk_prediction"] = model.predict_proba(X_active)[:, 1]
 
 # Banding logic
-def band(score):
+def risk_band(score):
     if score >= 0.95:
         return "HIGH"
     elif score >= 0.90:
@@ -154,7 +160,7 @@ def band(score):
     else:
         return "SAFE"
 
-active_df["flight_risk_band"] = active_df["flight_risk_prediction"].apply(band)
+active_df["flight_risk_band"] = active_df["flight_risk_prediction"].apply(risk_band)
 
 st.dataframe(
     active_df[selected_features + ["flight_risk_prediction", "flight_risk_band"]]
@@ -167,8 +173,8 @@ st.dataframe(
 out_cols = selected_features + ["flight_risk_prediction", "flight_risk_band"]
 csv_data = active_df[out_cols].to_csv(index=False).encode("utf-8")
 st.download_button(
-    "⬇ Download Active Employee Risk Scores",
-    csv_data,
+    label="⬇ Download Active Employee Risk Scores",
+    data=csv_data,
     file_name="flight_risk_active_employees.csv",
     mime="text/csv"
 )
@@ -177,17 +183,17 @@ st.download_button(
 # 8️⃣ BAND SUMMARY
 # ----------------------------------------------------
 st.header("5. Risk Band Summary")
-counts = (
+band_counts = (
     active_df["flight_risk_band"]
     .value_counts()
     .reindex(["HIGH", "MEDIUM", "LOW", "SAFE"])
     .fillna(0)
     .astype(int)
 )
-st.bar_chart(counts)
-st.write("Counts by band:", counts.to_dict())
+st.bar_chart(band_counts)
+st.write("Counts by band:", band_counts.to_dict())
 
-band_choice = st.selectbox("Show employees by band:", ["HIGH", "MEDIUM", "LOW", "SAFE"])
+band_choice = st.selectbox("Show employees in band:", ["HIGH", "MEDIUM", "LOW", "SAFE"])
 st.dataframe(
     active_df[active_df["flight_risk_band"] == band_choice]
     .sort_values("flight_risk_prediction", ascending=False)
