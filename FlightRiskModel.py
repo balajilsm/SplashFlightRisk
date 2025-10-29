@@ -1,35 +1,34 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from xgboost import XGBClassifier
+import xgboost as xgb
 
 # ----------------------------------------------------
-# CONFIG: Update these column names for your dataset
+# CONFIG
 # ----------------------------------------------------
 CSV_PATH_DEFAULT = "/mnt/data/emp_history_data2.csv"
-TARGET_COLUMN = "flight_risk"      # your label column (0/1)
+TARGET_COLUMN = "flight_risk"      # your target column (0/1)
 ACTIVE_FLAG_COL = "active_flag"    # 0 = active, 1 = terminated
 
 # ----------------------------------------------------
 # APP HEADER
 # ----------------------------------------------------
-st.set_page_config(page_title="Flight Risk Predictor (XGBoost Only)", layout="wide")
-st.title("✈ Employee Flight Risk Predictor (XGBoost Only)")
+st.set_page_config(page_title="Flight Risk Predictor (Pure XGBoost)", layout="wide")
+st.title("✈ Employee Flight Risk Predictor (Pure XGBoost)")
 
 st.markdown("""
-This lightweight version **runs on Python 3.13** — no scikit-learn required.  
-It uses only **XGBoost**, **pandas**, and **numpy**.
+This version uses **pure XGBoost API (no scikit-learn)** — perfect for Python 3.13.
 
 **Workflow**
 1. Upload employee CSV  
-2. Choose features  
-3. Train XGBoost model  
+2. Select features  
+3. Train pure XGBoost model  
 4. Predict for active employees (flag = 0)  
 5. Download results with risk bands  
 """)
 
 # ----------------------------------------------------
-# Helper: simple train/test split (no sklearn)
+# Helper: simple train/test split
 # ----------------------------------------------------
 def simple_split(X, y, test_size=0.2, seed=42):
     np.random.seed(seed)
@@ -63,7 +62,6 @@ else:
 
 st.dataframe(df.head(20))
 
-# Validate columns
 if TARGET_COLUMN not in df.columns:
     st.error(f"Target column '{TARGET_COLUMN}' not found.")
     st.stop()
@@ -101,35 +99,38 @@ train_df = df.dropna(subset=[TARGET_COLUMN])
 X = train_df[selected_features]
 y = train_df[TARGET_COLUMN]
 
-# Encode categoricals
+# One-hot encode categoricals
 X_encoded = pd.get_dummies(X, drop_first=True)
-
-# Split data
 X_train, X_test, y_train, y_test = simple_split(X_encoded, y, test_size=0.2, seed=42)
 
+# Convert to DMatrix
+dtrain = xgb.DMatrix(X_train, label=y_train)
+dtest = xgb.DMatrix(X_test, label=y_test)
+
 # ----------------------------------------------------
-# 5️⃣ TRAIN XGBOOST MODEL
+# 5️⃣ TRAIN PURE XGBOOST MODEL
 # ----------------------------------------------------
 st.header("3. Model Training")
-model = XGBClassifier(
-    n_estimators=300,
-    learning_rate=0.05,
-    max_depth=4,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    eval_metric="logloss",
-    random_state=42,
-    n_jobs=-1
-)
 
-with st.spinner("Training XGBoost model..."):
-    model.fit(X_train, y_train)
+params = {
+    "objective": "binary:logistic",
+    "eval_metric": "logloss",
+    "eta": 0.05,
+    "max_depth": 4,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "seed": 42,
+}
+
+with st.spinner("Training XGBoost model (pure API)..."):
+    model = xgb.train(params, dtrain, num_boost_round=300, evals=[(dtest, "test")], verbose_eval=False)
+
 st.success("✅ Model training complete!")
 
-# Evaluate performance
-y_pred = model.predict(X_test)
-y_pred_proba = model.predict_proba(X_test)[:, 1]
-accuracy = (y_pred == y_test).mean()
+# Evaluate accuracy manually
+y_pred = model.predict(dtest)
+y_pred_class = (y_pred >= 0.5).astype(int)
+accuracy = np.mean(y_pred_class == y_test.values)
 st.write(f"**Test Accuracy:** {accuracy:.3f}")
 
 # ----------------------------------------------------
@@ -142,14 +143,13 @@ if active_df.empty:
     st.warning("No active employees found (active_flag == 0).")
     st.stop()
 
-# Prepare features for prediction
 X_active = pd.get_dummies(active_df[selected_features], drop_first=True)
 X_active = X_active.reindex(columns=X_encoded.columns, fill_value=0)
+dactive = xgb.DMatrix(X_active)
 
-# Predict
-active_df["flight_risk_prediction"] = model.predict_proba(X_active)[:, 1]
+active_df["flight_risk_prediction"] = model.predict(dactive)
 
-# Banding logic
+# Banding
 def risk_band(score):
     if score >= 0.95:
         return "HIGH"
@@ -180,7 +180,7 @@ st.download_button(
 )
 
 # ----------------------------------------------------
-# 8️⃣ BAND SUMMARY
+# 8️⃣ RISK BAND SUMMARY
 # ----------------------------------------------------
 st.header("5. Risk Band Summary")
 band_counts = (
