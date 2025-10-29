@@ -285,22 +285,6 @@ else:
         .sort_values("flight_risk_prediction", ascending=False)
     )
 
-# ----------------------------------------------------
-# 6. DOWNLOAD RESULTS
-# ----------------------------------------------------
-st.header("6. Download Scored Active Employees")
 
-download_df = current_active_df[display_cols].sort_values(
-    "flight_risk_prediction", ascending=False
-)
-
-csv_bytes = download_df.to_csv(index=False).encode("utf-8")
-
-st.download_button(
-    label="⬇ Download Exit Risk Scores for Active Employees",
-    data=csv_bytes,
-    file_name="active_employee_exit_risk.csv",
-    mime="text/csv"
-)
 
 st.success("Done ✅")
