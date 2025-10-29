@@ -7,25 +7,23 @@ import xgboost as xgb
 # CONFIG
 # ----------------------------------------------------
 CSV_PATH_DEFAULT = "/mnt/data/emp_history_data2.csv"
-TARGET_COLUMN = "flight_risk"      # your label column (0/1)
-ACTIVE_FLAG_COL = "active_flag"    # 0 = active, 1 = terminated
 
-# ----------------------------------------------------
-# STREAMLIT HEADER
-# ----------------------------------------------------
-st.set_page_config(page_title="Flight Risk Predictor (Pure XGBoost)", layout="wide")
-st.title("✈ Employee Flight Risk Predictor (Pure XGBoost)")
+ACTIVE_FLAG_COL = "active_flag"     # 0 = still here, 1 = already left
+ID_CANDIDATES = ["person_id", "employee_id", "name", "emp_no"]  # we try to show one of these in outputs
+
+st.set_page_config(page_title="Flight Risk Predictor (Exit Risk Model)", layout="wide")
+st.title("✈ Employee Exit Risk Predictor (Pure XGBoost, No sklearn)")
 
 st.markdown("""
-This version uses **only XGBoost, pandas, and numpy** — no scikit-learn.
-It is 100% compatible with **Python 3.13**.
+Goal: Learn from who ALREADY left, and predict who MIGHT leave next.
 
-**Workflow**
-1. Upload employee CSV  
-2. Choose features  
-3. Train XGBoost model  
-4. Predict for active employees (flag = 0)  
-5. Download results with risk bands  
+Process:
+1. Load employee history
+2. Train model using terminated vs active
+3. Score current active employees (`active_flag = 0`)
+4. Output:
+   - `flight_risk_prediction` (probability to exit)
+   - `flight_risk_band` (HIGH / MEDIUM / LOW / SAFE)
 """)
 
 # ----------------------------------------------------
@@ -44,11 +42,22 @@ def simple_split(X, y, test_size=0.2, seed=42):
         y.iloc[test_idx],
     )
 
+# Risk banding helper
+def risk_band(score):
+    if score >= 0.95:
+        return "HIGH"
+    elif score >= 0.90:
+        return "MEDIUM"
+    elif score >= 0.80:
+        return "LOW"
+    else:
+        return "SAFE"
+
 # ----------------------------------------------------
-# 1️⃣ LOAD DATA
+# 1. LOAD DATA
 # ----------------------------------------------------
 st.header("1. Upload / Load Data")
-uploaded = st.file_uploader("Upload your employee CSV", type=["csv"])
+uploaded = st.file_uploader("Upload employee CSV", type=["csv"])
 
 if uploaded is not None:
     df = pd.read_csv(uploaded)
@@ -61,136 +70,111 @@ else:
         st.error(f"Could not load CSV: {e}")
         st.stop()
 
+st.subheader("Raw Data Preview")
 st.dataframe(df.head(20))
 
-if TARGET_COLUMN not in df.columns:
-    st.error(f"Target column '{TARGET_COLUMN}' not found.")
-    st.stop()
+# Validate column
 if ACTIVE_FLAG_COL not in df.columns:
-    st.error(f"Active flag column '{ACTIVE_FLAG_COL}' not found.")
+    st.error(f"Column '{ACTIVE_FLAG_COL}' not found in CSV. Please update ACTIVE_FLAG_COL.")
     st.stop()
 
 # ----------------------------------------------------
-# 2️⃣ FEATURE SELECTION
+# 2. FEATURE SELECTION
 # ----------------------------------------------------
-st.header("2. Choose Features")
-feature_cols = [c for c in df.columns if c not in [TARGET_COLUMN, ACTIVE_FLAG_COL]]
+st.header("2. Choose Features for the Model")
+
+# We DO NOT allow the label column as a feature
+feature_cols_all = [c for c in df.columns if c not in [ACTIVE_FLAG_COL]]
+
+# We'll propose defaults:
+default_cols = []
+# usually useful metadata columns for modeling
+for col in [
+    "tenure_years", "age", "age_group",
+    "promotion_count", "move_count",
+    "department_name", "position", "manager_name",
+    "job_name", "job_group", "work_location_name",
+    "location_state", "city",
+    "previous_salary", "annual_salary",
+    "percentage_change",
+]:
+    if col in feature_cols_all:
+        default_cols.append(col)
+
+# If default list ends up empty, just use everything except ACTIVE_FLAG_COL
+if not default_cols:
+    default_cols = feature_cols_all
+
 selected_features = st.multiselect(
-    "Select feature columns for model training:",
-    options=feature_cols,
-    default=feature_cols
+    "Select columns to TRAIN the model (attrition drivers):",
+    options=feature_cols_all,
+    default=default_cols
 )
+
 if len(selected_features) == 0:
     st.warning("Please select at least one feature.")
     st.stop()
 
-# ----------------------------------------------------
-# 3️⃣ TRAIN BUTTON
-# ----------------------------------------------------
-run_model = st.button("🚀 Run XGBoost Model")
+run_model = st.button("🚀 Train & Score Exit Risk")
 if not run_model:
-    st.info("Click **Run XGBoost Model** to start training.")
+    st.info("Click **Train & Score Exit Risk** to continue.")
     st.stop()
 
-
 # ----------------------------------------------------
-# 4️⃣ PREPARE & CLEAN DATA
+# 3. PREPARE TRAINING DATA
 # ----------------------------------------------------
-train_df = df.dropna(subset=[TARGET_COLUMN]).copy()
+st.header("3. Train Exit Risk Model")
 
-# Grab features and raw target
+# label: who left (1) vs who is still here (0)
+train_df = df.dropna(subset=[ACTIVE_FLAG_COL]).copy()
+
+y_raw = train_df[ACTIVE_FLAG_COL]
+
+# y_raw should already be 0 or 1:
+# 0 = active, 1 = exited
+# We keep that mapping exactly (1 means 'left'), which is good because
+# we want model to predict "chance of becoming 1".
+y = pd.to_numeric(y_raw, errors="coerce").fillna(0).astype(int)
+
+# Features
 X = train_df[selected_features]
-y_raw = train_df[TARGET_COLUMN]
 
-# --- Diagnose what's in the raw target column
-st.subheader("Target Column Check")
-st.write("Sample of target values:", y_raw.head(20))
-st.write("Unique raw target values:", y_raw.unique())
-
-# --- Convert target to numeric classes 0/1
-
-# Case A: already numeric (0/1, 0/100, etc.)
-y_numeric = pd.to_numeric(y_raw, errors="coerce")
-
-# Case B: text labels like "High", "Low", "Yes", "No", etc.
-if y_numeric.isna().all():
-    # fallback: convert text classes to 0/1
-    y_lower = y_raw.astype(str).str.strip().str.lower()
-
-    # Very common HR cases we see in attrition data:
-    # "active"/"terminated", "stay"/"quit", "no"/"yes", "low"/"high"
-    mapping_guess = {
-        "active": 0,
-        "stay": 0,
-        "stayed": 0,
-        "low": 0,
-        "no": 0,
-        "0": 0,
-        "false": 0,
-        "terminated": 1,
-        "quit": 1,
-        "left": 1,
-        "high": 1,
-        "yes": 1,
-        "1": 1,
-        "true": 1,
-    }
-    y_mapped = y_lower.map(mapping_guess)
-
-    # If still NaN after mapping, just default to 0
-    y_numeric = y_mapped.fillna(0)
-
-# Now force binary 0/1
-y_numeric = y_numeric.fillna(0).astype(float)
-y_binary = (y_numeric > 0).astype(int)
-
-st.write("Unique converted target values (after cleanup):", y_binary.unique(), "counts:", y_binary.value_counts(dropna=False))
-
-# Assign final y we'll train on
-y = y_binary
-
-# --- One-hot encode features
+# One-hot encode categoricals
 X_encoded = pd.get_dummies(X, drop_first=True)
 
 # Clean feature matrix
 X_encoded = X_encoded.replace([np.inf, -np.inf], np.nan).fillna(0)
 
-# Drop columns that are entirely zero
+# Remove all-zero columns (not useful for training)
 if X_encoded.shape[1] > 0:
     X_encoded = X_encoded.loc[:, (X_encoded != 0).any(axis=0)]
 
-# Custom split
+# Split to train/test
 X_train, X_test, y_train, y_test = simple_split(X_encoded, y, test_size=0.2, seed=42)
 
-st.subheader("Training Data Check")
-st.write("Training shape:", X_train.shape)
+# Sanity checks
+st.subheader("Training Diagnostics")
+st.write("X_train shape:", X_train.shape)
 st.write("Unique labels in y_train:", np.unique(y_train))
-st.write("Label counts in y_train:", pd.Series(y_train).value_counts(dropna=False))
+st.write("Label counts:", pd.Series(y_train).value_counts(dropna=False))
 st.write("Any NaN in X_train?", np.isnan(X_train.values).any())
 
-# Validate we truly have both classes
 if X_train.empty:
     st.error("❌ Training data is empty after filtering.")
     st.stop()
 
 if len(np.unique(y_train)) < 2:
-    st.error("❌ Only one class present in training labels. The model needs both 0 and 1 to learn.\n\n"
-             "Tip: You may be using the wrong target column for 'flight risk'. "
-             "Pick a column that actually marks leavers/quitters/terminated = 1.")
+    st.error("❌ Training label has only one class.\n"
+             "You need both active_flag=0 (active) and active_flag=1 (terminated) rows in your data "
+             "so the model can learn the difference.")
     st.stop()
 
-# Convert to DMatrix
+# Convert to DMatrix for XGBoost
 dtrain = xgb.DMatrix(X_train.values.astype(float), label=y_train.values.astype(float))
-dtest = xgb.DMatrix(X_test.values.astype(float), label=y_test.values.astype(float))
-
-
-# ----------------------------------------------------
-# 5️⃣ TRAIN PURE XGBOOST MODEL
-# ----------------------------------------------------
-st.header("3. Model Training")
+dtest  = xgb.DMatrix(X_test.values.astype(float),  label=y_test.values.astype(float))
 
 params = {
-    "objective": "binary:logistic",
+    "objective": "binary:logistic",     # predicts probability of exit
     "eval_metric": "logloss",
     "eta": 0.05,
     "max_depth": 4,
@@ -200,85 +184,123 @@ params = {
 }
 
 try:
-    with st.spinner("Training XGBoost model..."):
-        model = xgb.train(params, dtrain, num_boost_round=300,
-                          evals=[(dtest, "test")], verbose_eval=False)
+    with st.spinner("Training XGBoost model on historical exit data..."):
+        model = xgb.train(
+            params,
+            dtrain,
+            num_boost_round=300,
+            evals=[(dtest, "test")],
+            verbose_eval=False
+        )
     st.success("✅ Model training complete!")
 except xgb.core.XGBoostError as e:
     st.error("❌ XGBoost training failed:")
     st.code(str(e))
     st.stop()
 
-# Evaluate quickly
-y_pred = model.predict(dtest)
-y_pred_class = (y_pred >= 0.5).astype(int)
-accuracy = np.mean(y_pred_class == y_test.values)
-st.write(f"**Test Accuracy:** {accuracy:.3f}")
+# Evaluate model
+y_test_pred_prob = model.predict(dtest)
+y_test_pred_class = (y_test_pred_prob >= 0.5).astype(int)
+test_accuracy = np.mean(y_test_pred_class == y_test.values)
+st.write(f"**Validation Accuracy:** {test_accuracy:.3f}")
+st.caption("This is how well the model separates 'stayed' vs 'left' on held-out historical data.")
 
 # ----------------------------------------------------
-# 6️⃣ SCORE ACTIVE EMPLOYEES
+# 4. SCORE CURRENT ACTIVE EMPLOYEES (WHO MAY LEAVE NEXT)
 # ----------------------------------------------------
-st.header("4. Score Active Employees")
-active_df = df[df[ACTIVE_FLAG_COL] == 0].copy()
-if active_df.empty:
+st.header("4. Predict Exit Risk for ACTIVE Employees")
+
+current_active_df = df[df[ACTIVE_FLAG_COL] == 0].copy()
+
+if current_active_df.empty:
     st.warning("No active employees found (active_flag == 0).")
     st.stop()
 
-# Prepare active data
-X_active = pd.get_dummies(active_df[selected_features], drop_first=True)
+# Build feature matrix for current active
+X_active = current_active_df[selected_features]
+
+# One-hot encode using same transform as training
+X_active = pd.get_dummies(X_active, drop_first=True)
+
+# Align columns to training model columns
 X_active = X_active.reindex(columns=X_encoded.columns, fill_value=0)
+
+# Clean
 X_active = X_active.replace([np.inf, -np.inf], np.nan).fillna(0)
+
 dactive = xgb.DMatrix(X_active.values.astype(float))
 
-# Predict
-active_df["flight_risk_prediction"] = model.predict(dactive)
+# Predict probability of exit
+current_active_df["flight_risk_prediction"] = model.predict(dactive)
 
 # Banding
-def risk_band(score):
-    if score >= 0.95:
-        return "HIGH"
-    elif score >= 0.90:
-        return "MEDIUM"
-    elif score >= 0.80:
-        return "LOW"
-    else:
-        return "SAFE"
+current_active_df["flight_risk_band"] = current_active_df["flight_risk_prediction"].apply(risk_band)
 
-active_df["flight_risk_band"] = active_df["flight_risk_prediction"].apply(risk_band)
+# Try to include an identifier in the final output
+id_cols_available = [c for c in ID_CANDIDATES if c in current_active_df.columns]
+display_cols = id_cols_available + selected_features + [
+    "flight_risk_prediction",
+    "flight_risk_band"
+]
+# remove dupes while keeping order
+seen = set()
+display_cols = [c for c in display_cols if not (c in seen or seen.add(c))]
 
+st.subheader("Active Employee Exit Risk (sorted high → low)")
 st.dataframe(
-    active_df[selected_features + ["flight_risk_prediction", "flight_risk_band"]]
+    current_active_df[display_cols]
     .sort_values("flight_risk_prediction", ascending=False)
 )
 
 # ----------------------------------------------------
-# 7️⃣ DOWNLOAD RESULTS
-# ----------------------------------------------------
-out_cols = selected_features + ["flight_risk_prediction", "flight_risk_band"]
-csv_data = active_df[out_cols].to_csv(index=False).encode("utf-8")
-st.download_button(
-    label="⬇ Download Active Employee Risk Scores",
-    data=csv_data,
-    file_name="flight_risk_active_employees.csv",
-    mime="text/csv"
-)
-
-# ----------------------------------------------------
-# 8️⃣ RISK BAND SUMMARY
+# 5. RISK BAND SUMMARY / DRILLDOWN
 # ----------------------------------------------------
 st.header("5. Risk Band Summary")
+
 band_counts = (
-    active_df["flight_risk_band"]
+    current_active_df["flight_risk_band"]
     .value_counts()
     .reindex(["HIGH", "MEDIUM", "LOW", "SAFE"])
     .fillna(0)
     .astype(int)
 )
+
 st.bar_chart(band_counts)
+
 st.write("Counts by band:", band_counts.to_dict())
 
-band_choice = st.selectbox("Show employees in band:", ["HIGH", "MEDIUM", "LOW", "SAFE"])
-st.dataframe(
-    active_df[active_df["flight_risk_band"] == band_choice]
-    .sort_values("flight_risk_prediction", ascending=False)
+chosen_band = st.selectbox(
+    "Show employees in band:",
+    ["HIGH", "MEDIUM", "LOW", "SAFE"]
 )
+
+band_view = current_active_df[current_active_df["flight_risk_band"] == chosen_band]
+
+st.subheader(f"{chosen_band} Risk Employees")
+if len(band_view) == 0:
+    st.write("No employees in this band.")
+else:
+    st.dataframe(
+        band_view[display_cols]
+        .sort_values("flight_risk_prediction", ascending=False)
+    )
+
+# ----------------------------------------------------
+# 6. DOWNLOAD RESULTS
+# ----------------------------------------------------
+st.header("6. Download Scored Active Employees")
+
+download_df = current_active_df[display_cols].sort_values(
+    "flight_risk_prediction", ascending=False
+)
+
+csv_bytes = download_df.to_csv(index=False).encode("utf-8")
+
+st.download_button(
+    label="⬇ Download Exit Risk Scores for Active Employees",
+    data=csv_bytes,
+    file_name="active_employee_exit_risk.csv",
+    mime="text/csv"
+)
+
+st.success("Done ✅")
