@@ -92,41 +92,97 @@ if not run_model:
     st.info("Click **Run XGBoost Model** to start training.")
     st.stop()
 
+
 # ----------------------------------------------------
 # 4️⃣ PREPARE & CLEAN DATA
 # ----------------------------------------------------
-train_df = df.dropna(subset=[TARGET_COLUMN])
+train_df = df.dropna(subset=[TARGET_COLUMN]).copy()
+
+# Grab features and raw target
 X = train_df[selected_features]
-y = train_df[TARGET_COLUMN]
+y_raw = train_df[TARGET_COLUMN]
 
-# Convert y to 0/1 strictly
-y = pd.to_numeric(y, errors="coerce").fillna(0)
-y = (y > 0).astype(int)
+# --- Diagnose what's in the raw target column
+st.subheader("Target Column Check")
+st.write("Sample of target values:", y_raw.head(20))
+st.write("Unique raw target values:", y_raw.unique())
 
-# One-hot encode categoricals
+# --- Convert target to numeric classes 0/1
+
+# Case A: already numeric (0/1, 0/100, etc.)
+y_numeric = pd.to_numeric(y_raw, errors="coerce")
+
+# Case B: text labels like "High", "Low", "Yes", "No", etc.
+if y_numeric.isna().all():
+    # fallback: convert text classes to 0/1
+    y_lower = y_raw.astype(str).str.strip().str.lower()
+
+    # Very common HR cases we see in attrition data:
+    # "active"/"terminated", "stay"/"quit", "no"/"yes", "low"/"high"
+    mapping_guess = {
+        "active": 0,
+        "stay": 0,
+        "stayed": 0,
+        "low": 0,
+        "no": 0,
+        "0": 0,
+        "false": 0,
+        "terminated": 1,
+        "quit": 1,
+        "left": 1,
+        "high": 1,
+        "yes": 1,
+        "1": 1,
+        "true": 1,
+    }
+    y_mapped = y_lower.map(mapping_guess)
+
+    # If still NaN after mapping, just default to 0
+    y_numeric = y_mapped.fillna(0)
+
+# Now force binary 0/1
+y_numeric = y_numeric.fillna(0).astype(float)
+y_binary = (y_numeric > 0).astype(int)
+
+st.write("Unique converted target values (after cleanup):", y_binary.unique(), "counts:", y_binary.value_counts(dropna=False))
+
+# Assign final y we'll train on
+y = y_binary
+
+# --- One-hot encode features
 X_encoded = pd.get_dummies(X, drop_first=True)
 
-# Replace bad values
+# Clean feature matrix
 X_encoded = X_encoded.replace([np.inf, -np.inf], np.nan).fillna(0)
 
-# Remove constant columns (all zeros)
-X_encoded = X_encoded.loc[:, (X_encoded != 0).any(axis=0)]
+# Drop columns that are entirely zero
+if X_encoded.shape[1] > 0:
+    X_encoded = X_encoded.loc[:, (X_encoded != 0).any(axis=0)]
 
-# Split data
+# Custom split
 X_train, X_test, y_train, y_test = simple_split(X_encoded, y, test_size=0.2, seed=42)
 
-# Sanity checks
-if X_train.empty or len(np.unique(y_train)) < 2:
-    st.error("❌ Training data invalid — empty or only one class in target.")
+st.subheader("Training Data Check")
+st.write("Training shape:", X_train.shape)
+st.write("Unique labels in y_train:", np.unique(y_train))
+st.write("Label counts in y_train:", pd.Series(y_train).value_counts(dropna=False))
+st.write("Any NaN in X_train?", np.isnan(X_train.values).any())
+
+# Validate we truly have both classes
+if X_train.empty:
+    st.error("❌ Training data is empty after filtering.")
     st.stop()
 
-st.write("Training shape:", X_train.shape)
-st.write("Unique labels:", np.unique(y_train))
-st.write("Any NaN in X_train?", np.isnan(X_train.values).any())
+if len(np.unique(y_train)) < 2:
+    st.error("❌ Only one class present in training labels. The model needs both 0 and 1 to learn.\n\n"
+             "Tip: You may be using the wrong target column for 'flight risk'. "
+             "Pick a column that actually marks leavers/quitters/terminated = 1.")
+    st.stop()
 
 # Convert to DMatrix
 dtrain = xgb.DMatrix(X_train.values.astype(float), label=y_train.values.astype(float))
 dtest = xgb.DMatrix(X_test.values.astype(float), label=y_test.values.astype(float))
+
 
 # ----------------------------------------------------
 # 5️⃣ TRAIN PURE XGBOOST MODEL
