@@ -69,14 +69,13 @@ if ACTIVE_FLAG_COL not in df.columns:
 st.header("2. Choose Features")
 
 all_features = [c for c in df.columns if c not in [TARGET_COLUMN]]
-default_features = all_features  # you can make a smaller default list if you want
+default_features = all_features
 
 selected_features = st.multiselect(
     "Select feature columns for the model:",
     options=all_features,
     default=default_features
 )
-
 if len(selected_features) == 0:
     st.error("Please select at least one feature.")
     st.stop()
